@@ -254,7 +254,9 @@ func getNetworkIDsByFilter(is *InstanceService, opts *networks.ListOpts) ([]stri
 	return uuids, nil
 }
 
-func (is *InstanceService) InstanceCreate(clusterName string, name string, config *openstackconfigv1.OpenstackProviderSpec, cmd string, keyName string) (instance *Instance, err error) {
+func (is *InstanceService) InstanceCreate(cluster *clusterv1.Cluster, machine *clusterv1.Machine, config *openstackconfigv1.OpenstackProviderSpec, cmd string, keyName string) (instance *Instance, err error) {
+	clusterName := fmt.Sprintf("%s/%s", cluster.ObjectMeta.Namespace, cluster.Name)
+
 	if config == nil {
 		return nil, fmt.Errorf("create Options need be specified to create instace")
 	}
@@ -295,9 +297,15 @@ func (is *InstanceService) InstanceCreate(clusterName string, name string, confi
 	}
 	userData := base64.StdEncoding.EncodeToString([]byte(cmd))
 	var ports_list []servers.Network
+
+	securityGroups, err := getSecurityGroups(is, cluster, machine, config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load securityGroups from cluster status: %v", err)
+	}
+
 	for _, net := range nets {
 		allPages, err := ports.List(is.networkClient, ports.ListOpts{
-			Name:      name,
+			Name:      machine.Name,
 			NetworkID: net.UUID,
 		}).AllPages()
 		if err != nil {
@@ -311,9 +319,9 @@ func (is *InstanceService) InstanceCreate(clusterName string, name string, confi
 		if len(portList) == 0 {
 			// create server port
 			portCreateOpts := ports.CreateOpts{
-				Name:           name,
+				Name:           machine.Name,
 				NetworkID:      net.UUID,
-				SecurityGroups: &config.SecurityGroups,
+				SecurityGroups: &securityGroups,
 			}
 			newPort, err := ports.Create(is.networkClient, portCreateOpts).Extract()
 			if err != nil {
@@ -335,7 +343,7 @@ func (is *InstanceService) InstanceCreate(clusterName string, name string, confi
 
 		if config.Trunk == true {
 			allPages, err := trunks.List(is.networkClient, trunks.ListOpts{
-				Name:   name,
+				Name:   machine.Name,
 				PortID: port.ID,
 			}).AllPages()
 			if err != nil {
@@ -349,7 +357,7 @@ func (is *InstanceService) InstanceCreate(clusterName string, name string, confi
 			if len(trunkList) == 0 {
 				// create trunk with the previous port as parent
 				trunkCreateOpts := trunks.CreateOpts{
-					Name:   name,
+					Name:   machine.Name,
 					PortID: port.ID,
 				}
 				newTrunk, err := trunks.Create(is.networkClient, trunkCreateOpts).Extract()
@@ -370,13 +378,13 @@ func (is *InstanceService) InstanceCreate(clusterName string, name string, confi
 	}
 
 	serverCreateOpts := servers.CreateOpts{
-		Name:             name,
+		Name:             machine.Name,
 		ImageName:        config.Image,
 		FlavorName:       config.Flavor,
 		AvailabilityZone: config.AvailabilityZone,
 		Networks:         ports_list,
 		UserData:         []byte(userData),
-		SecurityGroups:   config.SecurityGroups,
+		SecurityGroups:   securityGroups,
 		ServiceClient:    is.computeClient,
 	}
 	server, err := servers.Create(is.computeClient, keypairs.CreateOptsExt{
@@ -387,6 +395,38 @@ func (is *InstanceService) InstanceCreate(clusterName string, name string, confi
 		return nil, fmt.Errorf("Create new server err: %v", err)
 	}
 	return serverToInstance(server), nil
+}
+
+func getSecurityGroups(is *InstanceService, cluster *clusterv1.Cluster, machine *clusterv1.Machine,
+	config *openstackconfigv1.OpenstackProviderSpec) ([]string, error) {
+	clusterName := fmt.Sprintf("%s/%s", cluster.ObjectMeta.Name, cluster.Name)
+
+	secGroupService, err := NewSecGroupService(is.networkClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create security group service: %v", err)
+	}
+	clusterStatus, err := openstackconfigv1.ClusterStatusFromProviderStatus(cluster.Status.ProviderStatus)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load cluster provider status: %v", err)
+	}
+
+	clusterSpec, err := openstackconfigv1.ClusterSpecFromProviderSpec(cluster.Spec.ProviderSpec)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load cluster provider spec: %v", err)
+	}
+
+	err = secGroupService.Reconcile(clusterName, *clusterSpec, clusterStatus)
+	if err != nil {
+		return nil, fmt.Errorf("failed to reconcile security groups: %v", err)
+	}
+
+	if clusterSpec.ManagedSecurityGroups {
+		if util.IsControlPlaneMachine(machine) {
+			return []string{clusterStatus.ControlPlaneSecurityGroup.ID}, nil
+		}
+		return []string{clusterStatus.GlobalSecurityGroup.ID}, nil
+	}
+	return config.SecurityGroups, nil
 }
 
 func (is *InstanceService) InstanceDelete(id string) error {
